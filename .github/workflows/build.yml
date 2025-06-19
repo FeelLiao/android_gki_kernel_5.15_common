@@ -1,0 +1,217 @@
+name: Build Kernel with KernelSU & SUSFS (GKI/Bazel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernelsu_variant:
+        description: 'KernelSU Variant (KSU/NEXT/MKSU/WILD)'
+        required: true
+        default: 'KSU'
+      kernelsu_branch:
+        description: 'KernelSU Branch (Stable/Dev/Other)'
+        required: true
+        default: 'Stable'
+      kernelsu_branch_other:
+        description: 'Custom KernelSU Branch (if kernelsu_branch is Other)'
+        required: false
+        default: ""
+      os_patch_level:
+        description: 'OS Patch Level, e.g. 2024-07'
+        required: true
+        default: '2024-07'
+      sub_level:
+        description: 'Kernel sublevel, e.g. 149'
+        required: true
+        default: '149'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ANDROID_VERSION: "android13"
+      KERNEL_VERSION: "5.15"
+      OS_PATCH_LEVEL: ${{ github.event.inputs.os_patch_level }}
+      SUB_LEVEL: ${{ github.event.inputs.sub_level }}
+      CONFIG: android13-5.15-${{ github.event.inputs.sub_level }}
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+
+      - name: Install ccache
+        run: sudo apt update && sudo apt install -y ccache
+
+      - name: Setup ccache
+        run: |
+          mkdir -p ~/.cache/bazel
+          ccache --version
+          ccache --max-size=2G
+          ccache --set-config=compression=true
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+
+      - name: Download toolchain
+        run: |
+          AOSP_MIRROR=https://android.googlesource.com
+          BRANCH=main-kernel-build-2024
+          git clone $AOSP_MIRROR/kernel/prebuilts/build-tools -b $BRANCH --depth 1 kernel-build-tools
+          git clone $AOSP_MIRROR/platform/system/tools/mkbootimg -b $BRANCH --depth 1 mkbootimg
+
+      - name: Set environment variables
+        run: |
+          echo "AVBTOOL=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool" >> $GITHUB_ENV
+          echo "MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py" >> $GITHUB_ENV
+          echo "UNPACK_BOOTIMG=$GITHUB_WORKSPACE/mkbootimg/unpack_bootimg.py" >> $GITHUB_ENV
+
+      # === KernelSU集成 ===
+      - name: Download KernelSU setup.sh
+        run: |
+          VARIANT="${{ github.event.inputs.kernelsu_variant }}"
+          BRANCH="${{ github.event.inputs.kernelsu_branch }}"
+          BRANCH_OTHER="${{ github.event.inputs.kernelsu_branch_other }}"
+          if [ "$BRANCH" = "Stable" ]; then
+            KSU_URL="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
+            KSU_ARGS=""
+          elif [ "$BRANCH" = "Dev" ]; then
+            if [[ "$VARIANT" =~ ^(KSU|MKSU)$ ]]; then
+              KSU_URL="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
+              KSU_ARGS="-s main"
+            elif [ "$VARIANT" = "NEXT" ]; then
+              KSU_URL="https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh"
+              KSU_ARGS="-s next"
+            elif [ "$VARIANT" = "WILD" ]; then
+              KSU_URL="https://raw.githubusercontent.com/WildKernels/Wild_KSU/wild/kernel/setup.sh"
+              KSU_ARGS="-s wild"
+            fi
+          elif [ "$BRANCH" = "Other" ] && [ -n "$BRANCH_OTHER" ]; then
+            KSU_URL="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
+            KSU_ARGS="-s $BRANCH_OTHER"
+          else
+            echo "Invalid KernelSU branch/variant, abort."
+            exit 1
+          fi
+          echo "Downloading KernelSU setup.sh from $KSU_URL"
+          curl -LSs "$KSU_URL" -o setup.sh
+          echo "KSU_ARGS='$KSU_ARGS'" >> $GITHUB_ENV
+
+      - name: Integrate KernelSU
+        run: |
+          chmod +x setup.sh
+          ./setup.sh ${{ env.KSU_ARGS }}
+
+      # === SUSFS集成 ===
+      - name: Download SUSFS patches
+        run: |
+          SUSFS_BRANCH="gki-android13-5.15"
+          git clone --depth=1 -b "$SUSFS_BRANCH" https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+
+      - name: Apply SUSFS patches
+        run: |
+          cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch ./common/
+          cd common
+          patch -p1 --forward --fuzz=3 < 50_add_susfs_in_gki-android13-5.15.patch
+          cd ..
+          cp susfs4ksu/kernel_patches/fs/* ./common/fs/ || true
+          cp susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/ || true
+
+      # === 其他通用补丁（如有需要，可扩展）===
+
+      # === 修改defconfig，添加KSU和SUSFS选项 ===
+      - name: Enable KernelSU & SUSFS in defconfig
+        run: |
+          DEFCONFIG=common/arch/arm64/configs/gki_defconfig
+          echo "CONFIG_KSU=y" >> $DEFCONFIG
+          if [ "${{ github.event.inputs.kernelsu_variant }}" == "NEXT" ] || [ "${{ github.event.inputs.kernelsu_variant }}" == "WILD" ]; then
+            echo "CONFIG_KSU_KPROBES_HOOK=n" >> $DEFCONFIG
+          fi
+          echo "CONFIG_TMPFS_XATTR=y" >> $DEFCONFIG
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> $DEFCONFIG
+          echo "CONFIG_IP_NF_TARGET_TTL=y" >> $DEFCONFIG
+          echo "CONFIG_IP6_NF_TARGET_HL=y" >> $DEFCONFIG
+          echo "CONFIG_IP6_NF_MATCH_HL=y" >> $DEFCONFIG
+          echo "CONFIG_TCP_CONG_ADVANCED=y" >> $DEFCONFIG
+          echo "CONFIG_TCP_CONG_BBR=y" >> $DEFCONFIG
+          echo "CONFIG_NET_SCH_FQ=y" >> $DEFCONFIG
+          echo "CONFIG_TCP_CONG_BIC=n" >> $DEFCONFIG
+          echo "CONFIG_TCP_CONG_WESTWOOD=n" >> $DEFCONFIG
+          echo "CONFIG_TCP_CONG_HTCP=n" >> $DEFCONFIG
+          # SUSFS配置（与WildKernels一致）
+          echo "CONFIG_KSU_SUSFS=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> $DEFCONFIG
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> $DEFCONFIG
+          if [ "${{ github.event.inputs.kernelsu_variant }}" == "NEXT" ] || [ "${{ github.event.inputs.kernelsu_variant }}" == "WILD" ]; then
+            echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> $DEFCONFIG
+          else
+            echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> $DEFCONFIG
+          fi
+
+      # === Bazel编译 ===
+      - name: Build Kernel (bazel)
+        run: |
+          if [ -f "build/build.sh" ]; then
+            LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC="/usr/bin/ccache clang"
+          else
+            tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast --lto=thin //common:kernel_aarch64_dist
+          fi
+          ccache --show-stats
+
+      # === 制作 Android 13/14/15 Boot Image ===
+      - name: Prepare bootimgs directory
+        run: |
+          mkdir -p bootimgs
+          # 常见 GKI Bazel 输出路径
+          if [ -f "bazel-bin/common/kernel_aarch64/Image" ]; then
+            cp bazel-bin/common/kernel_aarch64/Image bootimgs/
+          fi
+          if [ -f "bazel-bin/common/kernel_aarch64/Image.lz4" ]; then
+            cp bazel-bin/common/kernel_aarch64/Image.lz4 bootimgs/
+          fi
+
+      - name: Create Android 13/14/15 boot image
+        run: |
+          cd bootimgs
+          # gzip
+          if [ -f Image ]; then
+            gzip -n -k -f -9 ./Image > ./Image.gz
+          fi
+
+          # 构建 boot.img
+          if [ -f ../mkbootimg/mkbootimg.py ] && [ -f Image ]; then
+            ${{ env.MKBOOTIMG }} --header_version 4 --kernel Image --output boot.img
+            ${{ env.AVBTOOL }} add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key ${{ env.BOOT_SIGN_KEY_PATH:-$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem }}
+          fi
+          # 构建 boot-gz.img
+          if [ -f Image.gz ]; then
+            ${{ env.MKBOOTIMG }} --header_version 4 --kernel Image.gz --output boot-gz.img
+            ${{ env.AVBTOOL }} add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key ${{ env.BOOT_SIGN_KEY_PATH:-$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem }}
+          fi
+          # 构建 boot-lz4.img
+          if [ -f Image.lz4 ]; then
+            ${{ env.MKBOOTIMG }} --header_version 4 --kernel Image.lz4 --output boot-lz4.img
+            ${{ env.AVBTOOL }} add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key ${{ env.BOOT_SIGN_KEY_PATH:-$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem }}
+          fi
+
+      # === 上传产物 ===
+      - name: Upload Kernel & Boot Images
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-and-boot-images
+          path: |
+            bootimgs/boot.img
+            bootimgs/boot-gz.img
+            bootimgs/boot-lz4.img
+            bootimgs/Image*
