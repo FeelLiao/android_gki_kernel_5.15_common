@@ -116,8 +116,6 @@ jobs:
           cp susfs4ksu/kernel_patches/fs/* ./common/fs/ || true
           cp susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/ || true
 
-      # === 其他通用补丁（如有需要，可扩展）===
-
       # === 修改defconfig，添加KSU和SUSFS选项 ===
       - name: Enable KernelSU & SUSFS in defconfig
         run: |
@@ -189,20 +187,26 @@ jobs:
             gzip -n -k -f -9 ./Image > ./Image.gz
           fi
 
+          # 确定 BOOT_SIGN_KEY_PATH
+          BOOT_SIGN_KEY_PATH="${{ env.BOOT_SIGN_KEY_PATH }}"
+          if [ -z "$BOOT_SIGN_KEY_PATH" ]; then
+            BOOT_SIGN_KEY_PATH="$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem"
+          fi
+
           # 构建 boot.img
           if [ -f ../mkbootimg/mkbootimg.py ] && [ -f Image ]; then
             ${{ env.MKBOOTIMG }} --header_version 4 --kernel Image --output boot.img
-            ${{ env.AVBTOOL }} add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key ${{ env.BOOT_SIGN_KEY_PATH:-$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem }}
+            ${{ env.AVBTOOL }} add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key "$BOOT_SIGN_KEY_PATH"
           fi
           # 构建 boot-gz.img
           if [ -f Image.gz ]; then
             ${{ env.MKBOOTIMG }} --header_version 4 --kernel Image.gz --output boot-gz.img
-            ${{ env.AVBTOOL }} add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key ${{ env.BOOT_SIGN_KEY_PATH:-$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem }}
+            ${{ env.AVBTOOL }} add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key "$BOOT_SIGN_KEY_PATH"
           fi
           # 构建 boot-lz4.img
           if [ -f Image.lz4 ]; then
             ${{ env.MKBOOTIMG }} --header_version 4 --kernel Image.lz4 --output boot-lz4.img
-            ${{ env.AVBTOOL }} add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key ${{ env.BOOT_SIGN_KEY_PATH:-$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem }}
+            ${{ env.AVBTOOL }} add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key "$BOOT_SIGN_KEY_PATH"
           fi
 
       # === 上传产物 ===
@@ -211,6 +215,8 @@ jobs:
         with:
           name: kernel-and-boot-images
           path: |
+            out/android13-5.15/dist/Image*
+            bazel-bin/common/kernel_aarch64/Image*
             bootimgs/boot.img
             bootimgs/boot-gz.img
             bootimgs/boot-lz4.img
